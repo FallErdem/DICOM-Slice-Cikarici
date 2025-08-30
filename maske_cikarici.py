@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Gelişmiş RT->CT eşleştirme ve sadece GTV∩BRAIN dilimlerini kaydetme scripti.
-- Tüm CT serilerini tarar, RTSTRUCT adaylarını tarar.
-- RTSTRUCT içindeki ReferencedSOPInstanceUID ile her CT serisinin
-  SOPInstanceUID setini karşılaştırarak en iyi RT-CT çiftini seçer.
-- Seçilen CT serisi yüklenir, RTStruct yüklenir.
-- GTV(ler) alınır, BRAIN veya BODY ROI'si varsa onunla kesişim alınır.
-- Sadece GTV'nin beyin içinde olduğu dilimler overlay ve mask olarak kaydedilir.
+Contour-level RTSTRUCT -> CT mask extractor
+- Doğru CT serisini seçer (UID overlap ile).
+- RTSTRUCT içindeki contour'ları doğrudan rasterize eder (world -> pixel).
+- GTV(ler) alınır, BRAIN (veya BODY fallback) ile kesişim hesaplanır.
+- Yalnızca GTV'nin BRAIN içinde olduğu dilimler mask/overlay olarak kaydedilir.
 """
 import os
 import glob
 import logging
 from pathlib import Path
-import itertools
 from collections import defaultdict
-
 import numpy as np
 import pydicom
 import SimpleITK as sitk
-from rt_utils import RTStructBuilder
 import cv2
-import re
+import itertools
+import json
 import sys
 
-# ------------------ KULLANICI AYARLARI ------------------
-BASE_DIR = r"D:\beyin_3_4_5\beyin3.2\1559224"   # hasta klasörü (içinde CT_*, RS_*, RT_* vb.)
-OUTPUT_DIR = r"D:\beyincikti\beyinv4"
-ROI_PREFIX = "gtv"           # hangi ROI öneki ile GTV'leri seçeceğiz
-MIN_RTSTRUCT_OVERLAP = 0.25  # en iyi RTSTRUCT'un overlap oranı bu eşiğin altında ise dur (güvenlik)
-MIN_OVERLAP_COUNT = 5        # en az bu sayıda örtüşme olmalı (opsiyonel ek güvenlik)
-SAVE_OVERLAY = True
+# ------------- AYARLAR -------------
+BASE_DIR = r"D:\beyin_3_4_5\beyin3.2\1559224"   # Hasta klasörü
+OUTPUT_DIR = r"D:\beyincikti\beyinv5"
+ROI_PREFIX = "gtv"        # GTV önek
+MIN_RTSTRUCT_OVERLAP = 0.20
+MIN_OVERLAP_COUNT = 3
 ALPHA = 0.6
-# -------------------------------------------------------
+# -----------------------------------
 
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -46,37 +41,21 @@ def normalize_text(t: str) -> str:
         s = s.replace(a,b)
     return s
 
-def find_subdir_with_prefix(base_dir: str, prefix: str):
-    # CT_ / RS_ / RT_ klasörlerini bulmak için
-    cands = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d)) and d.upper().startswith(prefix)]
-    if not cands:
-        return None
-    cands.sort(key=len, reverse=True)
-    return os.path.join(base_dir, cands[0])
-
-CT_ROOT = find_subdir_with_prefix(BASE_DIR, "CT_") or BASE_DIR  # bazı yapılar farklı olabilir; fallback BASE_DIR
-RS_ROOT = find_subdir_with_prefix(BASE_DIR, "RS_")
-RT_ROOT = find_subdir_with_prefix(BASE_DIR, "RT_")
-
-logging.info(f"Base: {BASE_DIR}")
-logging.info(f"CT root (tahmini): {CT_ROOT}")
-logging.info(f"RS root: {RS_ROOT}, RT root: {RT_ROOT}")
-
-# --- 1) CT serilerini bul ve her seri için file listesi --- 
+# CT serilerini bul
 reader = sitk.ImageSeriesReader()
-series_ids = reader.GetGDCMSeriesIDs(CT_ROOT) or []
+series_ids = reader.GetGDCMSeriesIDs(BASE_DIR) or []
 if not series_ids:
-    logging.critical("CT serisi bulunamadı. Dizin düzenini kontrol et.")
+    logging.critical("CT serisi bulunamadı. BASE_DIR içerik yapısını kontrol et.")
     sys.exit(1)
 
 series_files_map = {}
 for sid in series_ids:
-    files = reader.GetGDCMSeriesFileNames(CT_ROOT, sid)
+    files = reader.GetGDCMSeriesFileNames(BASE_DIR, sid)
     series_files_map[sid] = files
-    logging.info(f"Found CT series id={sid} with {len(files)} files")
+    logging.info(f"CT series: id={sid}, files={len(files)}")
 
-# --- 2) her seri için SOPInstanceUID setlerini çıkar (hızlı, stop_before_pixels) ---
-def build_uid_set_for_files(file_list):
+# Her seri için SOPInstanceUID seti
+def build_uid_set(file_list):
     s = set()
     for f in file_list:
         try:
@@ -88,13 +67,17 @@ def build_uid_set_for_files(file_list):
             continue
     return s
 
-series_uid_sets = {sid: build_uid_set_for_files(files) for sid, files in series_files_map.items()}
+series_uid_sets = {sid: build_uid_set(files) for sid, files in series_files_map.items()}
 
-# --- 3) RTSTRUCT adaylarını tara (RS_ROOT, RT_ROOT, BASE_DIR) ---
-def find_candidate_rtstructs():
+# RTSTRUCT adaylarını tara (RS_, RT_, BASE_DIR)
+def find_rtstruct_candidates():
     roots = []
-    if RS_ROOT: roots.append(RS_ROOT)
-    if RT_ROOT: roots.append(RT_ROOT)
+    # hypthetical common subdirs
+    for pref in ("RS_", "RT_"):
+        for d in os.listdir(BASE_DIR):
+            p = os.path.join(BASE_DIR, d)
+            if os.path.isdir(p) and d.upper().startswith(pref):
+                roots.append(p)
     roots.append(BASE_DIR)
     found = []
     seen = set()
@@ -110,17 +93,17 @@ def find_candidate_rtstructs():
                 continue
     return found
 
-candidates = find_candidate_rtstructs()
+candidates = find_rtstruct_candidates()
 logging.info(f"RTSTRUCT aday sayısı: {len(candidates)}")
 if not candidates:
-    logging.critical("Herhangi bir RTSTRUCT bulunamadı (RS_/RT_/BASE/alt).")
+    logging.critical("RTSTRUCT bulunamadı.")
     sys.exit(1)
 
-# --- 4) RTSTRUCT içindeki ReferencedSOPInstanceUID setlerini çıkar ve her CT serisi ile karşılaştır ---
-def extract_rt_ref_uids(rt_path):
+# RTSTRUCT içindeki Referenced SOP UIDs çek
+def extract_reference_uids(rtpath):
     uids = set()
     try:
-        ds = pydicom.dcmread(rt_path, stop_before_pixels=True)
+        ds = pydicom.dcmread(rtpath, stop_before_pixels=True)
         if hasattr(ds, "ROIContourSequence"):
             for rc in ds.ROIContourSequence:
                 if hasattr(rc, "ContourSequence"):
@@ -131,198 +114,246 @@ def extract_rt_ref_uids(rt_path):
                                 if uid:
                                     uids.add(uid)
     except Exception as e:
-        logging.debug(f"RT okunurken hata ({rt_path}): {e}")
+        logging.debug(f"RT read error {rtpath}: {e}")
     return uids
 
-best = {
-    "rt_path": None,
-    "series_id": None,
-    "overlap_ratio": 0.0,
-    "overlap_count": 0,
-    "ref_count": 0
-}
-
-for rt_path in candidates:
-    ref_uids = extract_rt_ref_uids(rt_path)
+# Her aday için her CT serisi ile overlap hesapla
+best = {"rt": None, "series": None, "ratio": 0.0, "count":0, "ref_count":0}
+for rt in candidates:
+    ref_uids = extract_reference_uids(rt)
     if not ref_uids:
-        logging.info(f"Aday RT {os.path.basename(rt_path)}: ReferencedSOPInstanceUID yok/boş. Atlanıyor.")
+        logging.info(f"Aday RT {os.path.basename(rt)} ReferencedSOPInstanceUID yok -> atla")
         continue
-    # her CT serisi ile overlap hesapla, en iyi seriyi seç
     for sid, uidset in series_uid_sets.items():
-        overlap_count = len(ref_uids & uidset)
-        # overlap oranını ref_uids üzerinden normalize edelim
-        overlap_ratio = overlap_count / float(len(ref_uids)) if len(ref_uids) > 0 else 0.0
-        logging.info(f"RT {os.path.basename(rt_path)} vs CT series {sid}: overlap {overlap_count}/{len(ref_uids)} -> {overlap_ratio:.3f}")
-        if overlap_ratio > best["overlap_ratio"]:
-            best.update(rt_path=rt_path, series_id=sid, overlap_ratio=overlap_ratio,
-                        overlap_count=overlap_count, ref_count=len(ref_uids))
+        overlap = len(ref_uids & uidset)
+        ratio = overlap / float(len(ref_uids)) if len(ref_uids)>0 else 0.0
+        logging.info(f"RT {os.path.basename(rt)} vs CT series {sid}: overlap {overlap}/{len(ref_uids)} -> {ratio:.3f}")
+        if ratio > best["ratio"]:
+            best.update(rt=rt, series=sid, ratio=ratio, count=overlap, ref_count=len(ref_uids))
 
-if best["rt_path"] is None:
-    logging.critical("Hiçbir RTSTRUCT içinde ReferencedSOPInstanceUID bulunamadı. Çıkılıyor.")
+if best["rt"] is None:
+    logging.critical("Hiçbir RTSTRUCT referans UID içermiyor. Çıkılıyor.")
     sys.exit(1)
 
-logging.info(f"Seçilen RTSTRUCT: {best['rt_path']}, CT series: {best['series_id']}, overlap={best['overlap_count']}/{best['ref_count']} ({best['overlap_ratio']:.3f})")
+logging.info(f"Seçilen RT: {best['rt']}  CT series: {best['series']}  overlap={best['count']}/{best['ref_count']} ({best['ratio']:.3f})")
 
-# Güvenlik eşiği
-if best["overlap_ratio"] < MIN_RTSTRUCT_OVERLAP or best["overlap_count"] < MIN_OVERLAP_COUNT:
-    logging.critical(f"En iyi eşleşme yetersiz: overlap_ratio={best['overlap_ratio']:.3f}, count={best['overlap_count']}. (eşik: ratio>={MIN_RTSTRUCT_OVERLAP} ve count>={MIN_OVERLAP_COUNT})")
-    logging.critical("Muhtemelen RTSTRUCT farklı seriyi referanslıyor. İşlem sonlandırıldı.")
+if best["ratio"] < MIN_RTSTRUCT_OVERLAP or best["count"] < MIN_OVERLAP_COUNT:
+    logging.critical(f"Eşleşme yetersiz (ratio {best['ratio']:.3f} veya count {best['count']}). Çıkılıyor.")
     sys.exit(1)
 
-selected_rt_path = best["rt_path"]
-selected_series_id = best["series_id"]
+selected_rt = best["rt"]
+selected_series_id = best["series"]
 selected_ct_files = series_files_map[selected_series_id]
-logging.info(f"Seçilen CT dosya sayısı: {len(selected_ct_files)} (series_id={selected_series_id})")
+logging.info(f"Seçilen CT dosya sayısı: {len(selected_ct_files)}")
 
-# --- 5) seçilen CT serisini SimpleITK ile yükle ---
-reader = sitk.ImageSeriesReader()
-reader.SetFileNames(selected_ct_files)
-ct_img = reader.Execute()
-ct_np = sitk.GetArrayFromImage(ct_img).astype(np.float32)  # (Z,Y,X)
-ct_shape = ct_np.shape
-logging.info(f"Yüklenen CT shape (Z,Y,X): {ct_shape}")
-
-# --- 6) rt-utils ile seçilen RTSTRUCT'ı yükle (bu RT artık seçilmiş) ---
-try:
-    rtstruct = RTStructBuilder.create_from(dicom_series_path=CT_ROOT, rt_struct_path=selected_rt_path)
-except Exception as e:
-    logging.critical(f"rt-utils yüklemede hata: {e}")
-    sys.exit(1)
-
-all_rois = rtstruct.get_roi_names() or []
-logging.info(f"RT içindeki ROI'lar: {all_rois}")
-
-# --- 7) GTV'leri seç (prefix ile) ---
-gtv_list = [r for r in all_rois if normalize_text(r).startswith(normalize_text(ROI_PREFIX))]
-if not gtv_list:
-    logging.critical("RT içinde GTV bulunamadı.")
-    sys.exit(1)
-logging.info(f"GTV listesi: {gtv_list}")
-
-# Helper: ROI mask'ı al ve CT ile hizala
-def find_permutation_to_match(mask_shape, target_shape):
-    # mask_shape: tuple mask array
-    # target_shape: (Z,Y,X)
-    for perm in itertools.permutations(range(3)):
-        if tuple(np.transpose(np.zeros(mask_shape), perm).shape) == tuple(target_shape):
-            return perm
-    return None
-
-def align_mask(mask_raw: np.ndarray, target_shape):
-    """
-    Deneyerek permute et, eğer Z boyutu farklısa nearest resample et.
-    Hataları açıklayıcı fırlat.
-    """
-    mask_shape = mask_raw.shape
-    # hızlı yol: eğer zaten aynı
-    if mask_shape == target_shape:
-        return mask_raw.astype(bool)
-
-    # tüm permütasyonları dene
-    for perm in itertools.permutations((0,1,2)):
-        permuted = np.transpose(mask_raw, perm)
-        if permuted.shape == target_shape:
-            logging.info(f"Mask permütasyonu bulundu: {perm}")
-            return permuted.astype(bool)
-
-    # eğer permute ettikten sonra rows/cols eşleşen varsa, z'yi resample et
-    # bul permüsyon hangi perm ile rows/cols == target Y,X
-    for perm in itertools.permutations((0,1,2)):
-        permuted = np.transpose(mask_raw, perm)
-        if permuted.shape[1] == target_shape[1] and permuted.shape[2] == target_shape[2]:
-            # permuted shape = (Z_src, Y, X)
-            z_src = permuted.shape[0]
-            z_tgt = target_shape[0]
-            if z_src != z_tgt:
-                # nearest neighbour sampling along Z
-                idx = np.round(np.linspace(0, z_src-1, z_tgt)).astype(int)
-                resampled = permuted[idx,:,:]
-                logging.info(f"Mask Z yeniden örneklendi: {z_src} -> {z_tgt} (perm {perm})")
-                return resampled.astype(bool)
-            else:
-                return permuted.astype(bool)
-
-    raise ValueError(f"Mask shape {mask_shape} target {target_shape} ile eşleşemedi (tüm perm denendi).")
-
-# GTV union mask oluştur
-gtv_union_raw = None
-for gtv in gtv_list:
+# --- CT slice metadata: uid->index, z positions, ds map ---
+uid_to_index = {}
+index_to_ds = {}
+z_positions = []
+for idx, f in enumerate(selected_ct_files):
     try:
-        m = rtstruct.get_roi_mask_by_name(gtv).astype(np.uint8)
-    except Exception as e:
-        logging.warning(f"ROI mask alınamadı ({gtv}): {e}")
-        continue
-    if gtv_union_raw is None:
-        gtv_union_raw = m.astype(np.uint8)
-    else:
-        gtv_union_raw = np.logical_or(gtv_union_raw, m).astype(np.uint8)
+        ds = pydicom.dcmread(f, stop_before_pixels=True)
+        uid = getattr(ds, "SOPInstanceUID", None) or f"NOUID_{idx}"
+        uid_to_index[uid] = idx
+        index_to_ds[idx] = ds
+        # z position: prefer ImagePositionPatient[2], fallback SliceLocation
+        try:
+            z = float(ds.ImagePositionPatient[2])
+        except Exception:
+            try:
+                z = float(ds.SliceLocation)
+            except Exception:
+                z = float(getattr(ds, "InstanceNumber", idx))
+        z_positions.append(z)
+    except Exception:
+        uid_to_index[f"NOUID_{idx}"] = idx
+        index_to_ds[idx] = None
+        z_positions.append(float(idx))
 
-if gtv_union_raw is None:
-    logging.critical("Hiçbir GTV maskesi alınamadı.")
+z_positions = np.array(z_positions)
+# Ensure ordering: SimpleITK reader probably returned ordered list, but let's build index sort mapping if needed.
+# But uid_to_index is built from the file order returned by GetGDCMSeriesFileNames, which is usually correct.
+
+# --- RTSTRUCT DICOM dataset ---
+rt_ds = pydicom.dcmread(selected_rt, stop_before_pixels=True)
+# map ROINumber -> ROIName
+num2name = {}
+if hasattr(rt_ds, "StructureSetROISequence"):
+    for roi in rt_ds.StructureSetROISequence:
+        num2name[roi.ROINumber] = getattr(roi, "ROIName", f"ROI_{roi.ROINumber}")
+
+# Utility: world (x,y,z) -> pixel (col,row) for a given slice ds
+def world_to_pixel(pt_world, slice_ds):
+    # slice_ds must have ImagePositionPatient, ImageOrientationPatient, PixelSpacing
+    ipp = np.array(slice_ds.ImagePositionPatient, dtype=float)
+    iop = np.array(slice_ds.ImageOrientationPatient, dtype=float)
+    row_dir = iop[0:3]
+    col_dir = iop[3:6]
+    ps = np.array(slice_ds.PixelSpacing, dtype=float)  # [row_spacing, col_spacing]
+    rel = np.array(pt_world, dtype=float) - ipp
+    # col = dot(rel, col_dir)/col_spacing ; row = dot(rel, row_dir)/row_spacing
+    col = np.dot(rel, col_dir) / ps[1]
+    row = np.dot(rel, row_dir) / ps[0]
+    return float(col), float(row)
+
+# Rasterize a single contour (ContourData points) into 2D mask for given slice index
+def rasterize_contour_to_slice(contour_points, slice_idx, rows, cols):
+    ds = index_to_ds.get(slice_idx)
+    if ds is None:
+        return np.zeros((rows, cols), dtype=np.uint8)
+    pts = np.array(contour_points).reshape(-1,3)
+    poly = []
+    for p in pts:
+        colf, rowf = world_to_pixel(p, ds)
+        # round
+        cx = int(round(colf))
+        ry = int(round(rowf))
+        # clip
+        cx = max(0, min(cols-1, cx))
+        ry = max(0, min(rows-1, ry))
+        poly.append([cx, ry])
+    if len(poly) < 3:
+        return np.zeros((rows, cols), dtype=np.uint8)
+    # prepare for cv2.fillPoly: array of shape (n,1,2) with dtype int32
+    arr = np.array(poly, dtype=np.int32)
+    arr = arr.reshape((-1,1,2))
+    mask = np.zeros((rows, cols), dtype=np.uint8)
+    cv2.fillPoly(mask, [arr], color=1)
+    return mask
+
+# Parse ROIContourSequence and rasterize into 3D masks (Z,Y,X)
+def rasterize_rt_rois(rt_ds, uid_to_index_map, z_positions_array, shape_ct):
+    """
+    Returns dict: roi_name -> 3D boolean mask (Z,Y,X)
+    """
+    rows = int(index_to_ds[0].Rows)
+    cols = int(index_to_ds[0].Columns)
+    zcount = shape_ct[0]
+    roi_masks = {}
+    if not hasattr(rt_ds, "ROIContourSequence"):
+        return roi_masks
+    for rc in rt_ds.ROIContourSequence:
+        refnum = getattr(rc, "ReferencedROINumber", None)
+        roi_name = num2name.get(refnum, f"ROI_{refnum}")
+        mask3d = np.zeros((zcount, rows, cols), dtype=np.uint8)
+        if not hasattr(rc, "ContourSequence"):
+            continue
+        for cs in rc.ContourSequence:
+            # get contour points
+            if not hasattr(cs, "ContourData"):
+                continue
+            contour_pts = cs.ContourData
+            # try to find referenced SOPInstanceUID (preferred)
+            slice_idx = None
+            if hasattr(cs, "ContourImageSequence"):
+                # usually only one item
+                try:
+                    for im in cs.ContourImageSequence:
+                        uid = getattr(im, "ReferencedSOPInstanceUID", None)
+                        if uid and uid in uid_to_index_map:
+                            slice_idx = uid_to_index_map[uid]
+                            break
+                except Exception:
+                    slice_idx = None
+            if slice_idx is None:
+                # fallback: compute mean z of contour and find nearest slice by z_positions
+                pts = np.array(contour_pts).reshape(-1,3)
+                zmean = float(np.mean(pts[:,2]))
+                # find closest index (abs difference)
+                slice_idx = int(np.argmin(np.abs(z_positions_array - zmean)))
+            # rasterize to that slice (if in range)
+            if 0 <= slice_idx < zcount:
+                m2d = rasterize_contour_to_slice(contour_pts, slice_idx, rows, cols)
+                mask3d[slice_idx] = np.logical_or(mask3d[slice_idx], m2d).astype(np.uint8)
+            else:
+                logging.warning(f"Contour mapped outside CT z range: slice_idx={slice_idx} zmean maybe out of range.")
+        # store mask if any
+        if mask3d.any():
+            roi_masks[roi_name] = mask3d.astype(bool)
+            logging.info(f"ROI {roi_name}: rasterized, nonzero slices = {np.count_nonzero(mask3d.max(axis=(1,2))>0)}")
+        else:
+            logging.info(f"ROI {roi_name}: rasterize sonucu boş.")
+    return roi_masks
+
+# Rasterize all ROIs
+ct_shape = (len(selected_ct_files), int(index_to_ds[0].Rows), int(index_to_ds[0].Columns))
+logging.info(f"CT shape used for rasterization: {ct_shape}")
+roi_masks = rasterize_rt_rois(rt_ds, uid_to_index, z_positions, ct_shape)
+
+# Hedef: GTV listesi ve BRAIN (veya BODY)
+all_roi_names = list(roi_masks.keys())
+logging.info(f"Rasterize ile elde edilen ROI sayısı: {len(all_roi_names)}")
+gtv_names = [n for n in all_roi_names if normalize_text(n).startswith(normalize_text(ROI_PREFIX))]
+if not gtv_names:
+    logging.critical("Rasterize sonucu GTV bulunamadı.")
     sys.exit(1)
+logging.info(f"GTV isimleri (rasterized): {gtv_names}")
 
-# align
-try:
-    gtv_aligned = align_mask(gtv_union_raw, ct_shape)
-except Exception as e:
-    logging.critical(f"GTV maskesi CT ile hizalanamadı: {e}")
-    sys.exit(1)
-
-# --- 8) BRAIN veya BODY ROI'sini bul (önce brain, sonra body) ---
-brain_candidates = [r for r in all_rois if "brain" in normalize_text(r) and len(normalize_text(r))>0]
-body_candidates = [r for r in all_rois if "body" in normalize_text(r)]
-
-brain_mask_aligned = None
+# BRAIN seçimi
+brain_candidates = [n for n in all_roi_names if "brain" in normalize_text(n)]
+body_candidates  = [n for n in all_roi_names if "body" in normalize_text(n)]
+brain_name = None
 if brain_candidates:
     brain_name = brain_candidates[0]
-    logging.info(f"BRAIN ROI bulundu: {brain_name} kullanılıyor.")
-    raw = rtstruct.get_roi_mask_by_name(brain_name).astype(np.uint8)
-    try:
-        brain_mask_aligned = align_mask(raw, ct_shape)
-    except Exception as e:
-        logging.warning(f"BRAIN maskesi hizalanamadı: {e}")
-        brain_mask_aligned = None
+    logging.info(f"BRAIN ROI kullanılacak: {brain_name}")
+elif body_candidates:
+    brain_name = body_candidates[0]
+    logging.info(f"BRAIN yok, BODY ROI kullanılacak fallback: {brain_name}")
+else:
+    logging.info("No BRAIN/BODY ROI found -- fallback to simple CT thresholding for body region.")
 
-if brain_mask_aligned is None and body_candidates:
-    body_name = body_candidates[0]
-    logging.info(f"BODY ROI bulundu: {body_name} kullanılıyor.")
-    raw = rtstruct.get_roi_mask_by_name(body_name).astype(np.uint8)
-    try:
-        brain_mask_aligned = align_mask(raw, ct_shape)  # treat as "brain area" for clipping
-    except Exception as e:
-        logging.warning(f"BODY maskesi hizalanamadı: {e}")
-        brain_mask_aligned = None
+# build final gtv union mask
+gtv_union = np.zeros(ct_shape, dtype=bool)
+for nm in gtv_names:
+    gtv_union = np.logical_or(gtv_union, roi_masks[nm])
 
-# Fallback: basit eşikleme ile body maskesi oluştur
-def estimate_body_mask_from_ct(ct_np_arr):
-    # Basit: HU > -300 (vücut), slice-per-slice morphological close fill holes
-    th = -300.0
-    mask = (ct_np_arr > th).astype(np.uint8)
-    # morphological closing/keep largest component per slice
+# brain mask
+if brain_name:
+    brain_mask = roi_masks.get(brain_name, np.zeros(ct_shape, dtype=bool))
+else:
+    # fallback threshold-based body estimation
+    # load CT as array via SimpleITK
+    reader.SetFileNames(selected_ct_files)
+    ct_img = reader.Execute()
+    ct_np = sitk.GetArrayFromImage(ct_img).astype(np.float32)  # (Z,Y,X)
+    # simple threshold: HU > -300 as body (slice-level postprocess)
+    bm = (ct_np > -300.0).astype(np.uint8)
+    # morphological close per slice to fill holes
     kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7,7))
-    for z in range(mask.shape[0]):
-        m = (mask[z]*255).astype(np.uint8)
+    for z in range(bm.shape[0]):
+        m = (bm[z]*255).astype(np.uint8)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kern, iterations=1)
-        # threshold back
-        mask[z] = (m>127).astype(np.uint8)
-    # Optionally keep largest connected component in 3D; skip heavy ops for speed
-    return mask.astype(bool)
+        bm[z] = (m>127).astype(np.uint8)
+    brain_mask = bm.astype(bool)
 
-if brain_mask_aligned is None:
-    logging.info("BRAIN/BODY ROI yok veya hizalanamadı. CT eşikleme ile beden alanı tahmini yapılıyor (fallback).")
-    brain_mask_aligned = estimate_body_mask_from_ct(ct_np)
-
-# --- 9) GTV ∩ BRAIN mask'ı ve sadece bu dilimleri kaydet ---
-final_mask = np.logical_and(gtv_aligned.astype(bool), brain_mask_aligned.astype(bool))
+# final intersection
+final_mask = np.logical_and(gtv_union, brain_mask)
 z_has = np.where(final_mask.any(axis=(1,2)))[0]
 if z_has.size == 0:
-    logging.warning("GTV ve BRAIN kesişimi boş. Kayıt yapılacak dilim yok.")
+    logging.warning("GTV ∩ BRAIN boş — kayıt yapılacak dilim yok. (kontur / hizalama kontrol et)")
+    # save debug info
+    debug_report = {
+        "selected_rt": selected_rt,
+        "selected_series": selected_series_id,
+        "gtv_names": gtv_names,
+        "brain_name": brain_name,
+        "gtv_nonzero_slices": int(np.count_nonzero(gtv_union.max(axis=(1,2))>0)),
+        "brain_nonzero_slices": int(np.count_nonzero(brain_mask.max(axis=(1,2))>0))
+    }
+    with open(Path(OUTPUT_DIR)/"debug_report.json", "w", encoding="utf-8") as f:
+        json.dump(debug_report, f, indent=2, ensure_ascii=False)
+    logging.info("Debug raporu kaydedildi -> debug_report.json")
     sys.exit(0)
 
-z_start, z_end = int(z_has.min()), int(z_has.max())
-logging.info(f"Final (GTV∩BRAIN) Z aralığı: {z_start}..{z_end} (toplam dilim: {len(z_has)})")
+logging.info(f"Final mask dilimleri: {len(z_has)} (z aralığı {z_has.min()}..{z_has.max()})")
 
-# window param (try read from CT files)
+# load CT image array for saving overlays (if not loaded)
+if 'ct_np' not in globals():
+    reader.SetFileNames(selected_ct_files)
+    ct_img = reader.Execute()
+    ct_np = sitk.GetArrayFromImage(ct_img).astype(np.float32)
+
+# try read window center/width from first slices
 WINDOW_CENTER = 40.0
 WINDOW_WIDTH = 80.0
 for f in selected_ct_files[:20]:
@@ -339,52 +370,42 @@ for f in selected_ct_files[:20]:
             break
     except Exception:
         continue
-logging.info(f"Using window C={WINDOW_CENTER}, W={WINDOW_WIDTH}")
 
 def apply_window(img2d, center, width):
-    low = center - width / 2.0
-    high = center + width / 2.0
+    low = center - width/2.0
+    high = center + width/2.0
     arr = np.clip(img2d, low, high)
     arr = (arr - low) / (high - low + 1e-6) * 255.0
     return arr.astype(np.uint8)
 
-out_mask_dir = Path(OUTPUT_DIR) / "masks"
-out_overlay_dir = Path(OUTPUT_DIR) / "overlays"
-out_mask_dir.mkdir(parents=True, exist_ok=True)
-out_overlay_dir.mkdir(parents=True, exist_ok=True)
+mask_out_dir = Path(OUTPUT_DIR)/"masks"
+overlay_out_dir = Path(OUTPUT_DIR)/"overlays"
+mask_out_dir.mkdir(parents=True, exist_ok=True)
+overlay_out_dir.mkdir(parents=True, exist_ok=True)
 
 frame_idx = 0
 for z in z_has:
-    try:
-        m0 = final_mask[z].astype(np.uint8)
-        ct_slice = ct_np[z]
-        g0 = apply_window(ct_slice, WINDOW_CENTER, WINDOW_WIDTH)
-        rgb0 = cv2.cvtColor(g0, cv2.COLOR_GRAY2BGR)
-        overlay0 = rgb0.copy()
-        overlay0[m0 > 0] = (0,0,255)  # BGR red
-        blended0 = cv2.addWeighted(rgb0, 1.0, overlay0, ALPHA, 0.0)
-        # save
-        cv2.imwrite(str(out_overlay_dir / f"overlay_{frame_idx:03d}.png"), blended0)
-        cv2.imwrite(str(out_mask_dir / f"mask_{frame_idx:03d}.png"), (m0*255).astype(np.uint8))
-        frame_idx += 1
-    except Exception as e:
-        logging.error(f"Slice {z} kaydedilemedi: {e}")
+    m0 = final_mask[z].astype(np.uint8)
+    ct_slice = ct_np[z]
+    g = apply_window(ct_slice, WINDOW_CENTER, WINDOW_WIDTH)
+    rgb = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    overlay = rgb.copy()
+    overlay[m0 > 0] = (0,0,255)
+    blended = cv2.addWeighted(rgb, 1.0, overlay, ALPHA, 0.0)
+    cv2.imwrite(str(overlay_out_dir / f"overlay_{frame_idx:03d}.png"), blended)
+    cv2.imwrite(str(mask_out_dir / f"mask_{frame_idx:03d}.png"), (m0*255).astype(np.uint8))
+    frame_idx += 1
 
 logging.info(f"Kaydedilen dilim sayısı: {frame_idx}")
-logging.info(f"Maskler -> {out_mask_dir}")
-logging.info(f"Overlay -> {out_overlay_dir}")
-
-# Ayrıca rapor dosyası yaz (hangi RT/CT seçildi)
+# rapor
 report = {
-    "patient_folder": BASE_DIR,
-    "selected_rtstruct": selected_rt_path,
-    "selected_ct_series_id": selected_series_id,
-    "selected_ct_file_count": len(selected_ct_files),
-    "gtv_list": gtv_list,
-    "z_slices_saved": int(frame_idx)
+    "selected_rt": selected_rt,
+    "selected_series": selected_series_id,
+    "saved_slices": frame_idx,
+    "gtv_names": gtv_names,
+    "brain_name": brain_name
 }
-import json
-with open(Path(OUTPUT_DIR) / "selection_report.json", "w", encoding="utf-8") as f:
+with open(Path(OUTPUT_DIR)/"selection_result.json","w",encoding="utf-8") as f:
     json.dump(report, f, indent=2, ensure_ascii=False)
 
-logging.info("İşlem tamamlandı.")
+logging.info("İşlem tamamlandı. Çıktılar kaydedildi.")
